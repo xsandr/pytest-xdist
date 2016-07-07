@@ -24,7 +24,7 @@ def pytest_addoption(parser):
                           "when crashed (set to zero to disable this feature)")
     group._addoption(
         '--dist', metavar="distmode",
-        action="store", choices=['load', 'each', 'no'],
+        action="store", choices=['load', 'each', 'no', 'package'],
         type="choice", dest="dist", default="no",
         help=("set mode for distributing tests to exec environments.\n\n"
               "each: send each test to each available environment.\n\n"

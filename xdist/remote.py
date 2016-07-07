@@ -44,6 +44,7 @@ class SlaveInteractor:
 
     def pytest_runtestloop(self, session):
         self.log("entering main loop")
+        bulk_run = False
         torun = []
         while 1:
             try:
@@ -55,10 +56,14 @@ class SlaveInteractor:
                 torun.extend(kwargs['indices'])
             elif name == "runtests_all":
                 torun.extend(range(len(session.items)))
+            elif name == 'RUNNING_MODE':
+                if kwargs == 'package':
+                    bulk_run = True
             self.log("items to run:", torun)
-            # only run if we have an item and a next item
-            while len(torun) >= 2:
+            conditions = 1 if bulk_run else 2
+            while len(torun) >= conditions:
                 self.run_tests(torun)
+
             if name == "shutdown":
                 if torun:
                     self.run_tests(torun)

@@ -463,6 +463,7 @@ class DSession:
     """
     def __init__(self, config):
         self.config = config
+        self.dist = self.config.getvalue("dist")
         self.log = py.log.Producer("dsession")
         if not config.option.debug:
             py.log.setconsumer(self.log._keywords, None)
@@ -507,6 +508,9 @@ class DSession:
         """
         self.nodemanager = NodeManager(self.config)
         nodes = self.nodemanager.setup_nodes(putevent=self.queue.put)
+        for node in nodes:
+            node.channel.send(("RUNNING_MODE", self.dist))
+
         self._active_nodes.update(nodes)
         self._session = session
 
@@ -523,14 +527,17 @@ class DSession:
 
     def pytest_runtestloop(self):
         numnodes = len(self.nodemanager.specs)
-        dist = self.config.getvalue("dist")
-        if dist == "load":
+
+        if self.dist == "load":
             self.sched = LoadScheduling(numnodes, log=self.log,
                                         config=self.config)
-        elif dist == "each":
+        elif self.dist == "each":
             self.sched = EachScheduling(numnodes, log=self.log)
+        elif self.dist == "package":
+            self.sched = PackageScheduling(numnodes, log=self.log,
+                                           config=self.config)
         else:
-            assert 0, dist
+            assert 0, self.dist
         self.shouldstop = False
         while not self.session_finished:
             self.loop_once()
@@ -574,6 +581,8 @@ class DSession:
             node.shutdown()
         else:
             self.sched.addnode(node)
+            if self.dist == "package" and self.sched.collection_is_completed:
+                self.sched.schedule(node)
 
     def slave_slavefinished(self, node):
         """Emitted when node executes its pytest_sessionfinish hook.
@@ -659,17 +668,26 @@ class DSession:
         """
         if rep.when == "call" or (rep.when == "setup" and not rep.passed):
             self.sched.remove_item(node, rep.item_index, rep.duration)
+
         # self.report_line("testreport %s: %s" %(rep.id, rep.status))
         rep.node = node
         self.config.hook.pytest_runtest_logreport(report=rep)
         self._handlefailures(rep)
+
+        # we finished last test for this worker
+        if self.dist == "package":
+            if rep.when == 'teardown' and not self.sched.node2pending[node]:
+                # if we still have some tests to do
+                if self.sched.pending:
+                    self._clone_node(node, reset_gateway_id=False)
+                    node.shutdown()
 
     def slave_collectreport(self, node, rep):
         """Emitted when a node calls the pytest_collectreport hook."""
         if rep.failed:
             self._failed_slave_collectreport(node, rep)
 
-    def _clone_node(self, node):
+    def _clone_node(self, node, reset_gateway_id=True):
         """Return new node based on an existing one.
 
         This is normally for when a node dies, this will copy the spec
@@ -678,7 +696,8 @@ class DSession:
         "slave_*" hooks and do work soon.
         """
         spec = node.gateway.spec
-        spec.id = None
+        if reset_gateway_id:
+            spec.id = None
         self.nodemanager.group.allocate_id(spec)
         node = self.nodemanager.setup_node(spec, self.queue.put)
         self._active_nodes.add(node)
@@ -781,10 +800,55 @@ class TerminalDistReporter:
             return
         self.write_line("[%s] node down: %s" % (node.gateway.id, error))
 
-    # def pytest_xdist_rsyncstart(self, source, gateways):
-    #    targets = ",".join([gw.id for gw in gateways])
-    #    msg = "[%s] rsyncing: %s" %(targets, source)
-    #    self.write_line(msg)
-    # def pytest_xdist_rsyncfinish(self, source, gateways):
-    #    targets = ", ".join(["[%s]" % gw.id for gw in gateways])
-    #    self.write_line("rsyncfinish: %s -> %s" %(source, targets))
+
+class PackageScheduling(LoadScheduling):
+    """
+    PackageScheduling runs tests from the same package on the same node
+    """
+    def init_distribute(self):
+        assert self.collection_is_completed
+
+        # Initial distribution already happened, reschedule on all nodes
+        if self.collection is not None:
+            return
+
+        if not self._check_nodes_have_same_collection():
+            self.log('**Different tests collected, aborting run**')
+
+        self.collection = list(self.node2collection.values())[0]
+        self.pending[:] = range(len(self.collection))
+        if not self.collection:
+            return
+
+        # group by package name
+        self.groups_length = []
+        self.collection_copy = []
+        by_package = lambda x: x.split('/')[:-1]
+        for _, group in itertools.groupby(self.collection[:], key=by_package):
+            group = list(group)
+            self.groups_length.append(len(group))
+            self.collection_copy.extend(group)
+
+        self.collection = self.collection_copy
+
+        # send package for testing to every node
+        for node in self.nodes:
+            if self.groups_length:
+                self._send_tests(node, self.groups_length.pop(0))
+
+        if not self.pending:
+            for node in self.nodes:
+                node.shutdown()
+
+    def schedule(self, node):
+        self._send_tests(node, self.groups_length.pop(0))
+
+    def tests_finished(self):
+        if not self.collection_is_completed:
+            return False
+        if self.pending:
+            return False
+        return True
+
+    def remove_item(self, node, item_index, duration=0):
+        self.node2pending[node].remove(item_index)
